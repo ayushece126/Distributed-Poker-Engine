@@ -78,7 +78,7 @@ func NewServer(cfg ServerConfig) *Server {
 	s.transport = tr
 
 	tr.AddPeer = s.addPeer
-	tr.DelPeer = s.addPeer
+	tr.DelPeer = s.delPeer
 
 	go func(s *Server) {
 		apiServer := NewAPIServer(cfg.APIListenAddr, s.gameState)
@@ -213,9 +213,10 @@ func (s *Server) loop() {
 		case peer := <-s.delPeer:
 			logrus.WithFields(logrus.Fields{
 				"addr": peer.conn.RemoteAddr(),
-			}).Info("new player disconnected")
+			}).Info("player disconnected")
 
 			delete(s.peers, peer.conn.RemoteAddr().String())
+			s.gameState.RemovePlayer(peer.listenAddr)
 
 			// If a new peer connects to the server we send our handshake message and wait
 			// for his reply.
@@ -244,7 +245,7 @@ func (s *Server) handleNewPeer(peer *Peer) error {
 	}
 
 	// NOTE: this readLoop always needs to start after the handshake!
-	go peer.ReadLoop(s.msgCh)
+	go peer.ReadLoop(s.msgCh, s.delPeer)
 
 	if !peer.outbound {
 		if err := s.SendHandshake(peer); err != nil {

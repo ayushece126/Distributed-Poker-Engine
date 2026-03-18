@@ -23,19 +23,19 @@ func (p *Peer) Send(b []byte) error {
 	return err
 }
 
-func (p *Peer) ReadLoop(msgch chan *Message) {
+func (p *Peer) ReadLoop(msgch chan *Message, delch chan *Peer) {
 	for {
 		msg := new(Message)
 		if err := gob.NewDecoder(p.conn).Decode(msg); err != nil {
-			logrus.Errorf("decode message error: %s", err)
+			logrus.Errorf("decode message error from %s: %s", p.conn.RemoteAddr(), err)
 			break
 		}
 
 		msgch <- msg
 	}
 
-	// TODO(@anthdm): unregister this peer!!!
 	p.conn.Close()
+	delch <- p
 }
 
 type TCPTransport struct {

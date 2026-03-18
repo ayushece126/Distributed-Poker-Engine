@@ -44,6 +44,18 @@ func (p *PlayersList) add(addr string) {
 	sort.Sort(p)
 }
 
+func (p *PlayersList) remove(addr string) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	for i, v := range p.list {
+		if v == addr {
+			p.list = append(p.list[:i], p.list[i+1:]...)
+			break
+		}
+	}
+}
+
 func (p *PlayersList) getIndex(addr string) int {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
@@ -450,6 +462,56 @@ func (g *Game) sendToPlayers(payload any, addr ...string) {
 	g.broadcastch <- BroadcastTo{
 		To:      addr,
 		Payload: payload,
+	}
+}
+
+func (g *Game) RemovePlayer(addr string) {
+	idx := g.playersList.getIndex(addr)
+	if idx == -1 {
+		return
+	}
+
+	wasCurrentTurn := g.canTakeAction(addr)
+	wasDealer := g.isFromCurrentDealer(addr)
+
+	g.playersList.remove(addr)
+	g.table.RemovePlayerByAddr(addr)
+
+	logrus.WithFields(logrus.Fields{
+		"addr": addr,
+	}).Info("player removed from game state")
+
+	if g.playersList.len() < 2 {
+		logrus.Info("not enough players to continue, resetting game state")
+		g.setStatus(GameStatusConnected)
+		return
+	}
+
+	currTurn := int(g.currentPlayerTurn.Get())
+	if idx < currTurn {
+		g.currentPlayerTurn.Set(int32(currTurn - 1))
+	} else if idx == currTurn {
+		if currTurn >= g.playersList.len() {
+			g.currentPlayerTurn.Set(0)
+		}
+	}
+
+	dealerIdx := int(g.currentDealer.Get())
+	if idx < dealerIdx {
+		g.currentDealer.Set(int32(dealerIdx - 1))
+	} else if idx == dealerIdx {
+		if dealerIdx >= g.playersList.len() {
+			g.currentDealer.Set(0)
+		}
+	}
+
+	if GameStatus(g.currentStatus.Get()) != GameStatusConnected && GameStatus(g.currentStatus.Get()) != GameStatusPlayerReady {
+		if wasCurrentTurn {
+			logrus.Info("disconnected player was the current turn; skipping to next turn")
+			if wasDealer {
+				g.advanceToNexRound()
+			}
+		}
 	}
 }
 
