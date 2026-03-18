@@ -1,43 +1,109 @@
 package main
 
 import (
+	"net/http"
 	"time"
 
-	"github.com/ayushece126/poker/p2p"
+	"github.com/anthdm/ggpoker/p2p"
 )
 
-func makeServerAndStart(addr string) *p2p.Server {
+func makeServerAndStart(addr, apiAddr string) *p2p.Server {
 	cfg := p2p.ServerConfig{
-		Version:     "GGPOKER V0.1-alpha",
-		ListenAddr:  addr,
-		GameVariant: p2p.TexasHoldem,
+		Version:       "GGPOKER V0.2-alpha",
+		ListenAddr:    addr,
+		APIListenAddr: apiAddr,
+		GameVariant:   p2p.TexasHoldem,
 	}
 	server := p2p.NewServer(cfg)
 	go server.Start()
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(time.Millisecond * 200)
 
 	return server
 }
 
 func main() {
-	playerA := makeServerAndStart(":3000")
-	playerB := makeServerAndStart(":4000")
-	playerC := makeServerAndStart(":8080")
-	playerD := makeServerAndStart(":6000")
-	playerE := makeServerAndStart(":8089")
-	playerF := makeServerAndStart(":5080")
+	playerA := makeServerAndStart(":3000", ":3001") // dealer
+	playerB := makeServerAndStart(":4000", ":4001") // sb
+	playerC := makeServerAndStart(":6000", ":6001") // bb
+	playerD := makeServerAndStart(":7000", ":7001") // bb + 2
 
-	time.Sleep(200 * time.Millisecond)
+	go func() {
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:3001/ready")
+
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:4001/ready")
+
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:6001/ready")
+
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:7001/ready")
+
+		// [3000:D, 4000:sb, 6000:bb, 7000]
+		// PREFLOP
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:4001/fold")
+
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:6001/fold")
+
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:7001/fold")
+
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:3001/fold")
+
+		// FLOP
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:4001/fold")
+
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:6001/fold")
+
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:7001/fold")
+
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:3001/fold")
+
+		// TURN
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:4001/fold")
+
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:6001/fold")
+
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:7001/fold")
+
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:3001/fold")
+
+		// RIVER
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:4001/fold")
+
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:6001/fold")
+
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:7001/fold")
+
+		time.Sleep(time.Second * 2)
+		http.Get("http://localhost:3001/fold")
+
+	}()
+
+	time.Sleep(time.Millisecond * 200)
 	playerB.Connect(playerA.ListenAddr)
-	time.Sleep(200 * time.Millisecond)
+
+	time.Sleep(time.Millisecond)
 	playerC.Connect(playerB.ListenAddr)
-	time.Sleep(200 * time.Millisecond)
+
+	time.Sleep(time.Millisecond * 200)
 	playerD.Connect(playerC.ListenAddr)
-	time.Sleep(200 * time.Millisecond)
-	playerE.Connect(playerD.ListenAddr)
-	time.Sleep(200 * time.Millisecond)
-	playerF.Connect(playerE.ListenAddr)
 
 	select {}
 }
