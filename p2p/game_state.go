@@ -205,6 +205,7 @@ type Game struct {
 	playersList *PlayersList
 
 	table *Table
+	Pot   int
 }
 
 func NewGame(addr string, bc chan BroadcastTo) *Game {
@@ -237,32 +238,42 @@ func (g *Game) isFromCurrentDealer(from string) bool {
 	return g.playersList.get(g.currentDealer.Get()) == from
 }
 
+func (g *Game) applyPlayerAction(addr string, action PlayerAction, value int) error {
+	player, err := g.table.GetPlayer(addr)
+	if err != nil {
+		return err
+	}
+
+	if action == PlayerActionBet || action == PlayerActionCall {
+		if player.Balance < value {
+			return fmt.Errorf("player %s has insufficient balance for bet of %d", addr, value)
+		}
+		player.Balance -= value
+		player.CurrentBet += value
+		g.Pot += value
+	}
+	return nil
+}
+
 func (g *Game) handlePlayerAction(from string, action MessagePlayerAction) error {
 	if !g.canTakeAction(from) {
 		return fmt.Errorf("player (%s) taking action before his turn", from)
 	}
 
-	// If we receive a message from a peer that doenst have the same game status
-	// as ours, but is not the current dealer we return an error. Cannot proceed.
 	if action.CurrentGameStatus != GameStatus(g.currentStatus.Get()) && !g.isFromCurrentDealer(from) {
 		return fmt.Errorf("player (%s) has not the correct game status (%s)", from, action.CurrentGameStatus)
 	}
 
-	g.recvPlayerActions.addAction(from, action)
-
-	// Every player in this case will need to set the current game status to the next one (next round).
-	// NEXT
-	// 1. set the next player action to IDLE
-	// 2. set the next current game status
-	if g.playersList.get(g.currentDealer.Get()) == from {
-		g.advanceToNexRound()
+	if err := g.applyPlayerAction(from, action.Action, action.Value); err != nil {
+		return err
 	}
 
-	// TODO:(@anthdm)
-	// This still not fixed!
-	// This function should be handle the logic of picking the next player
-	// internally. Cause maybe the next player in the list in not the next index, hence not
-	// g.currentPlayerTurn + 1, due to the fact that his status can be just "connected"
+	g.recvPlayerActions.addAction(from, action)
+
+	if g.playersList.get(g.currentDealer.Get()) == from {
+		g.advanceToNexRound() // Automatically steps if the dealer acts
+	}
+
 	g.incNextPlayer()
 
 	logrus.WithFields(logrus.Fields{
@@ -279,14 +290,16 @@ func (g *Game) TakeAction(action PlayerAction, value int) error {
 		return fmt.Errorf("taking action before its my turn %s", g.listenAddr)
 	}
 
+	if err := g.applyPlayerAction(g.listenAddr, action, value); err != nil {
+		return err
+	}
+
 	g.currentPlayerAction.Set((int32)(action))
 
 	g.incNextPlayer()
 
-	// If we are the dealer that just took an action, we can go to the next round.
 	if g.listenAddr == g.playersList.get(g.currentDealer.Get()) {
-		// NEXT
-		g.advanceToNexRound()
+		g.advanceToNexRound() // Automatically steps if the dealer acts
 	}
 
 	a := MessagePlayerAction{
@@ -321,10 +334,37 @@ func (g *Game) advanceToNexRound() {
 	g.currentPlayerAction.Set(int32(PlayerActionNone))
 
 	if GameStatus(g.currentStatus.Get()) == GameStatusRiver {
-		g.SetReady()
+		g.Showdown()
 		return
 	}
 	g.currentStatus.Set(int32(g.getNextGameStatus()))
+}
+
+func (g *Game) Showdown() {
+	// TODO: P2P Showdown Logic
+	// 1. Exchange encryption keys over the network to reveal hole cards.
+	// 2. Fetch 5 community cards.
+	// 3. Run deck.Evaluate() on each active player's 7 cards.
+	// 4. Find the player with the highest Hand.Score
+	// 5. Award the Pot.
+
+	logrus.WithFields(logrus.Fields{
+		"pot": g.Pot,
+		"we":  g.listenAddr,
+	}).Info("Executing showdown and awarding pot")
+
+	// For now, we simply award the pot to the current dealer to prevent chip leaking
+	dealerAddr := g.playersList.get(g.currentDealer.Get())
+	currentDealer, _ := g.table.GetPlayer(dealerAddr)
+	if currentDealer != nil {
+		currentDealer.Balance += g.Pot
+	}
+	g.Pot = 0
+
+	// Advance the dealer button to the next person
+	g.currentDealer.Set(int32(g.getNextDealer()))
+	
+	g.SetReady()
 }
 
 func (g *Game) incNextPlayer() {
@@ -576,7 +616,11 @@ func (g *Game) getPositionOnTable() int {
 // }
 
 func (g *Game) getNextDealer() int {
-	panic("TODO")
+	current := int(g.currentDealer.Get())
+	if g.playersList.len() == 0 {
+		return 0
+	}
+	return (current + 1) % g.playersList.len()
 }
 
 // getNextPositionOnTable returns the index of the next player in the PlayersList.

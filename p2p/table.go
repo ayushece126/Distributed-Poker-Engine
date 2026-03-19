@@ -11,6 +11,9 @@ type Player struct {
 	currentAction PlayerAction
 	gameStatus    GameStatus
 	tablePos      int
+
+	Balance    int
+	CurrentBet int
 }
 
 func NewPlayer(addr string) *Player {
@@ -19,6 +22,8 @@ func NewPlayer(addr string) *Player {
 		currentAction: PlayerActionNone,
 		gameStatus:    GameStatusConnected,
 		tablePos:      -1,
+		Balance:       10000,
+		CurrentBet:    0,
 	}
 }
 
