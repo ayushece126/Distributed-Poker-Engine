@@ -121,8 +121,7 @@ func (a *AtomicInt) Get() int32 {
 }
 
 func (a *AtomicInt) Inc() {
-	currentValue := a.Get()
-	a.Set(currentValue + 1)
+	atomic.AddInt32(&a.value, 1)
 }
 
 type PlayerActionsRecv struct {
@@ -363,7 +362,7 @@ func (g *Game) Showdown() {
 
 	// Advance the dealer button to the next person
 	g.currentDealer.Set(int32(g.getNextDealer()))
-	
+
 	g.SetReady()
 }
 
