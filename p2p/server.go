@@ -39,6 +39,18 @@ type ServerConfig struct {
 	MaxPlayers    int
 }
 
+// APIAction wraps an API-initiated player action to be serialized through the server loop.
+type APIAction struct {
+	Action PlayerAction
+	Value  int
+	Result chan error // response channel
+}
+
+// APIReady wraps a ready-up request from the API to be serialized.
+type APIReady struct {
+	Result chan error
+}
+
 type Server struct {
 	ServerConfig
 
@@ -49,8 +61,9 @@ type Server struct {
 	delPeer     chan *Peer
 	msgCh       chan *Message
 	broadcastch chan BroadcastTo
+	apiActionCh chan APIAction // serialized API player actions
+	apiReadyCh  chan APIReady  // serialized API ready requests
 
-	// gameState *GameState
 	gameState *Game
 }
 
@@ -66,13 +79,10 @@ func NewServer(cfg ServerConfig) *Server {
 		delPeer:      make(chan *Peer),
 		msgCh:        make(chan *Message, 100),
 		broadcastch:  make(chan BroadcastTo, 100),
+		apiActionCh:  make(chan APIAction, 10),
+		apiReadyCh:   make(chan APIReady, 10),
 	}
-	// s.gameState = NewGameState(s.ListenAddr, s.broadcastch)
 	s.gameState = NewGame(s.ListenAddr, s.broadcastch)
-
-	// if s.ListenAddr == ":3000" {
-	// 	s.gameState.isDealer = true // just for testing!
-	// }
 
 	tr := NewTCPTransport(s.ListenAddr)
 	s.transport = tr
@@ -81,14 +91,13 @@ func NewServer(cfg ServerConfig) *Server {
 	tr.DelPeer = s.delPeer
 
 	go func(s *Server) {
-		apiServer := NewAPIServer(cfg.APIListenAddr, s.gameState)
+		apiServer := NewAPIServer(cfg.APIListenAddr, s)
 
 		logrus.WithFields(logrus.Fields{
 			"listenAddr": cfg.APIListenAddr,
 		}).Info("starting API server")
 
 		apiServer.Run()
-
 	}(s)
 
 	return s
@@ -153,10 +162,14 @@ func (s *Server) Peers() []string {
 }
 
 func (s *Server) SendHandshake(p *Peer) error {
+	s.gameState.mu.Lock()
+	status := GameStatus(s.gameState.currentStatus)
+	s.gameState.mu.Unlock()
+
 	hs := &Handshake{
 		GameVariant: s.GameVariant,
 		Version:     s.Version,
-		GameStatus:  GameStatus(s.gameState.currentStatus.Get()),
+		GameStatus:  status,
 		ListenAddr:  s.ListenAddr,
 	}
 
@@ -204,11 +217,9 @@ func (s *Server) loop() {
 	for {
 		select {
 		case msg := <-s.broadcastch:
-			go func() {
-				if err := s.Broadcast(msg); err != nil {
-					logrus.Errorf("broadcast error: %s", err)
-				}
-			}()
+			if err := s.Broadcast(msg); err != nil {
+				logrus.Errorf("broadcast error: %s", err)
+			}
 
 		case peer := <-s.delPeer:
 			logrus.WithFields(logrus.Fields{
@@ -218,19 +229,24 @@ func (s *Server) loop() {
 			delete(s.peers, peer.conn.RemoteAddr().String())
 			s.gameState.RemovePlayer(peer.listenAddr)
 
-			// If a new peer connects to the server we send our handshake message and wait
-			// for his reply.
 		case peer := <-s.addPeer:
 			if err := s.handleNewPeer(peer); err != nil {
 				logrus.Errorf("handle peer error: %s", err)
 			}
 
 		case msg := <-s.msgCh:
-			go func() {
-				if err := s.handleMessage(msg); err != nil {
-					logrus.Errorf("handle msg error: %s", err)
-				}
-			}()
+			// Serialized: NO goroutine, processed inline on the server loop
+			if err := s.handleMessage(msg); err != nil {
+				logrus.Errorf("handle msg error: %s", err)
+			}
+
+		case apiAction := <-s.apiActionCh:
+			// API actions serialized through the same loop
+			apiAction.Result <- s.gameState.TakeAction(apiAction.Action, apiAction.Value)
+
+		case apiReady := <-s.apiReadyCh:
+			s.gameState.SetReady()
+			apiReady.Result <- nil
 		}
 	}
 }

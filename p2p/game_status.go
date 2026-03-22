@@ -14,6 +14,8 @@ func (pa PlayerAction) String() string {
 		return "BET"
 	case PlayerActionCall:
 		return "CALL"
+	case PlayerActionRaise:
+		return "RAISE"
 	default:
 		return "INVALID"
 	}
@@ -25,6 +27,7 @@ const (
 	PlayerActionCheck
 	PlayerActionBet
 	PlayerActionCall
+	PlayerActionRaise
 )
 
 type GameStatus int32

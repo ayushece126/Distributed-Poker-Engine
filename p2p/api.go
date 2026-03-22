@@ -34,12 +34,12 @@ func JSON(w http.ResponseWriter, status int, v any) error {
 
 type APIServer struct {
 	listenAddr string
-	game       *Game
+	server     *Server
 }
 
-func NewAPIServer(listenAddr string, game *Game) *APIServer {
+func NewAPIServer(listenAddr string, server *Server) *APIServer {
 	return &APIServer{
-		game:       game,
+		server:     server,
 		listenAddr: listenAddr,
 	}
 }
@@ -50,9 +50,23 @@ func (s *APIServer) Run() {
 	r.HandleFunc("/ready", makeHTTPHandleFunc(s.handlePlayerReady))
 	r.HandleFunc("/fold", makeHTTPHandleFunc(s.handlePlayerFold))
 	r.HandleFunc("/check", makeHTTPHandleFunc(s.handlePlayerCheck))
+	r.HandleFunc("/call", makeHTTPHandleFunc(s.handlePlayerCall))
 	r.HandleFunc("/bet/{value}", makeHTTPHandleFunc(s.handlePlayerBet))
+	r.HandleFunc("/raise/{value}", makeHTTPHandleFunc(s.handlePlayerRaise))
 
 	http.ListenAndServe(s.listenAddr, r)
+}
+
+// sendAction routes a player action through the server's serialized channel
+// and blocks until the server loop processes it.
+func (s *APIServer) sendAction(action PlayerAction, value int) error {
+	result := make(chan error, 1)
+	s.server.apiActionCh <- APIAction{
+		Action: action,
+		Value:  value,
+		Result: result,
+	}
+	return <-result
 }
 
 func (s *APIServer) handlePlayerBet(w http.ResponseWriter, r *http.Request) error {
@@ -62,7 +76,7 @@ func (s *APIServer) handlePlayerBet(w http.ResponseWriter, r *http.Request) erro
 		return err
 	}
 
-	if err := s.game.TakeAction(PlayerActionBet, value); err != nil {
+	if err := s.sendAction(PlayerActionBet, value); err != nil {
 		return err
 	}
 
@@ -70,20 +84,43 @@ func (s *APIServer) handlePlayerBet(w http.ResponseWriter, r *http.Request) erro
 }
 
 func (s *APIServer) handlePlayerCheck(w http.ResponseWriter, r *http.Request) error {
-	if err := s.game.TakeAction(PlayerActionCheck, 0); err != nil {
+	if err := s.sendAction(PlayerActionCheck, 0); err != nil {
 		return err
 	}
 	return JSON(w, http.StatusOK, "CHECKED")
 }
 
 func (s *APIServer) handlePlayerFold(w http.ResponseWriter, r *http.Request) error {
-	if err := s.game.TakeAction(PlayerActionFold, 0); err != nil {
+	if err := s.sendAction(PlayerActionFold, 0); err != nil {
 		return err
 	}
 	return JSON(w, http.StatusOK, "FOLDED")
 }
 
 func (s *APIServer) handlePlayerReady(w http.ResponseWriter, r *http.Request) error {
-	s.game.SetReady()
+	result := make(chan error, 1)
+	s.server.apiReadyCh <- APIReady{Result: result}
+	if err := <-result; err != nil {
+		return err
+	}
 	return JSON(w, http.StatusOK, "READY")
+}
+
+func (s *APIServer) handlePlayerCall(w http.ResponseWriter, r *http.Request) error {
+	if err := s.sendAction(PlayerActionCall, 0); err != nil {
+		return err
+	}
+	return JSON(w, http.StatusOK, "CALLED")
+}
+
+func (s *APIServer) handlePlayerRaise(w http.ResponseWriter, r *http.Request) error {
+	valueStr := mux.Vars(r)["value"]
+	value, err := strconv.Atoi(valueStr)
+	if err != nil {
+		return err
+	}
+	if err := s.sendAction(PlayerActionRaise, value); err != nil {
+		return err
+	}
+	return JSON(w, http.StatusOK, fmt.Sprintf("RAISED to %d", value))
 }

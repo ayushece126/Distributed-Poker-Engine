@@ -11,6 +11,7 @@ type Player struct {
 	currentAction PlayerAction
 	gameStatus    GameStatus
 	tablePos      int
+	HasFolded     bool
 
 	Balance    int
 	CurrentBet int

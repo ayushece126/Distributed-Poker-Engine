@@ -6,7 +6,6 @@ import (
 	"sort"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/anthdm/ggpoker/deck"
@@ -100,31 +99,6 @@ func (p *PlayersList) Less(i, j int) bool {
 	return portI < portJ
 }
 
-type AtomicInt struct {
-	value int32
-}
-
-func NewAtomicInt(value int32) *AtomicInt {
-	return &AtomicInt{
-		value: value,
-	}
-}
-
-func (a *AtomicInt) String() string {
-	return fmt.Sprintf("%d", a.value)
-}
-
-func (a *AtomicInt) Set(value int32) {
-	atomic.StoreInt32(&a.value, value)
-}
-
-func (a *AtomicInt) Get() int32 {
-	return atomic.LoadInt32(&a.value)
-}
-
-func (a *AtomicInt) Inc() {
-	atomic.AddInt32(&a.value, 1)
-}
 
 type PlayerActionsRecv struct {
 	mu          sync.RWMutex
@@ -185,19 +159,14 @@ func (pr *PlayersReady) clear() {
 }
 
 type Game struct {
-	listenAddr  string
+	mu         sync.Mutex // guards all mutable game state
+	listenAddr string
 	broadcastch chan BroadcastTo
 
-	// currentStatus should be atomically accessable.
-	currentStatus *AtomicInt
-
-	// currentPlayerAction should be atomically accessable.
-	currentPlayerAction *AtomicInt
-	// currentDealer should be atomically accessable.
-	// NOTE: this will be -1 when the game is in a bootstrapped state.
-	currentDealer *AtomicInt
-	// currentPlayerTurn should be atomically accessable.
-	currentPlayerTurn *AtomicInt
+	currentStatus       int32
+	currentPlayerAction int32
+	currentDealer       int32
+	currentPlayerTurn   int32
 
 	playersReady      *PlayersReady
 	recvPlayerActions *PlayerActionsRecv
@@ -208,14 +177,18 @@ type Game struct {
 	table *Table
 	Pot   int
 
+	// Betting round state
+	CurrentHighBet   int
+	ActionsThisRound int
+
 	// Mental Poker State
 	Keys           *KeyPair
 	EncryptedDeck  [][]byte
 	DeckPointer    int
-	HoleCards      []deck.Card                // Our private hole cards
-	CommunityCards []deck.Card                // Shared community cards
-	ShowdownHands  map[string][]deck.Card     // addr -> revealed hole cards from showdown
-	ringCounter    int                        // increments to generate unique ring IDs
+	HoleCards      []deck.Card
+	CommunityCards []deck.Card
+	ShowdownHands  map[string][]deck.Card
+	ringCounter    int
 }
 
 func NewGame(addr string, bc chan BroadcastTo) *Game {
@@ -225,18 +198,15 @@ func NewGame(addr string, bc chan BroadcastTo) *Game {
 	}
 
 	g := &Game{
-		listenAddr:          addr,
-		broadcastch:         bc,
-		currentStatus:       NewAtomicInt(int32(GameStatusConnected)),
-		playersReady:        NewPlayersReady(),
-		playersList:         NewPlayersList(),
-		currentPlayerAction: NewAtomicInt(0),
-		currentDealer:       NewAtomicInt(0),
-		recvPlayerActions:   NewPlayerActionsRevc(),
-		currentPlayerTurn:   NewAtomicInt(0),
-		table:               NewTable(6),
-		Keys:                keys,
-		ShowdownHands:       make(map[string][]deck.Card),
+		listenAddr:      addr,
+		broadcastch:     bc,
+		currentStatus:   int32(GameStatusConnected),
+		playersReady:    NewPlayersReady(),
+		playersList:     NewPlayersList(),
+		recvPlayerActions: NewPlayerActionsRevc(),
+		table:           NewTable(6),
+		Keys:            keys,
+		ShowdownHands:   make(map[string][]deck.Card),
 	}
 
 	g.playersList.add(addr)
@@ -247,12 +217,23 @@ func NewGame(addr string, bc chan BroadcastTo) *Game {
 }
 
 func (g *Game) canTakeAction(from string) bool {
-	currentPlayerAddr := g.playersList.get(g.currentPlayerTurn.Get())
+	currentPlayerAddr := g.playersList.get(g.currentPlayerTurn)
 	return currentPlayerAddr == from
 }
 
 func (g *Game) isFromCurrentDealer(from string) bool {
-	return g.playersList.get(g.currentDealer.Get()) == from
+	return g.playersList.get(g.currentDealer) == from
+}
+
+// activePlayers returns the number of non-folded players.
+func (g *Game) activePlayers() int {
+	count := 0
+	for _, p := range g.table.Players() {
+		if !p.HasFolded {
+			count++
+		}
+	}
+	return count
 }
 
 func (g *Game) applyPlayerAction(addr string, action PlayerAction, value int) error {
@@ -261,15 +242,157 @@ func (g *Game) applyPlayerAction(addr string, action PlayerAction, value int) er
 		return err
 	}
 
-	if action == PlayerActionBet || action == PlayerActionCall {
+	if player.HasFolded {
+		return fmt.Errorf("player %s has already folded", addr)
+	}
+
+	switch action {
+	case PlayerActionFold:
+		player.HasFolded = true
+		player.currentAction = PlayerActionFold
+		logrus.Infof("[%s] Player %s folded", g.listenAddr, addr)
+
+	case PlayerActionCheck:
+		if g.CurrentHighBet != player.CurrentBet {
+			return fmt.Errorf("player %s cannot check when current high bet is %d (your bet: %d)",
+				addr, g.CurrentHighBet, player.CurrentBet)
+		}
+		player.currentAction = PlayerActionCheck
+
+	case PlayerActionBet:
+		if g.CurrentHighBet != 0 {
+			return fmt.Errorf("player %s cannot bet when a bet already exists (%d); use raise instead",
+				addr, g.CurrentHighBet)
+		}
+		if value <= 0 {
+			return fmt.Errorf("bet value must be positive")
+		}
 		if player.Balance < value {
-			return fmt.Errorf("player %s has insufficient balance for bet of %d", addr, value)
+			return fmt.Errorf("player %s has insufficient balance (%d) for bet of %d", addr, player.Balance, value)
 		}
 		player.Balance -= value
 		player.CurrentBet += value
 		g.Pot += value
+		g.CurrentHighBet = player.CurrentBet
+		g.ActionsThisRound = 1 // Reset: everyone else must act again
+		player.currentAction = PlayerActionBet
+
+	case PlayerActionCall:
+		callAmount := g.CurrentHighBet - player.CurrentBet
+		if callAmount <= 0 {
+			return fmt.Errorf("player %s has nothing to call (already matched high bet)", addr)
+		}
+		if player.Balance < callAmount {
+			// All-in: call with whatever they have
+			callAmount = player.Balance
+		}
+		player.Balance -= callAmount
+		player.CurrentBet += callAmount
+		g.Pot += callAmount
+		player.currentAction = PlayerActionCall
+
+	case PlayerActionRaise:
+		if g.CurrentHighBet == 0 {
+			return fmt.Errorf("player %s cannot raise when no bet exists; use bet instead", addr)
+		}
+		newTotal := player.CurrentBet + value
+		if newTotal <= g.CurrentHighBet {
+			return fmt.Errorf("raise must exceed current high bet of %d (your total would be %d)",
+				g.CurrentHighBet, newTotal)
+		}
+		if player.Balance < value {
+			return fmt.Errorf("player %s has insufficient balance (%d) for raise of %d", addr, player.Balance, value)
+		}
+		player.Balance -= value
+		player.CurrentBet += value
+		g.Pot += value
+		g.CurrentHighBet = player.CurrentBet
+		g.ActionsThisRound = 1 // Reset: everyone else must respond
+		player.currentAction = PlayerActionRaise
+
+	default:
+		return fmt.Errorf("unknown player action: %d", action)
 	}
+
+	g.ActionsThisRound++
 	return nil
+}
+
+// isBettingRoundComplete returns true when all active (non-folded) players have had
+// a chance to act AND all their bets match the current high bet.
+func (g *Game) isBettingRoundComplete() bool {
+	active := g.activePlayers()
+	if active <= 1 {
+		return true // only one player left
+	}
+
+	// Everyone must have acted at least once
+	if g.ActionsThisRound < active {
+		return false
+	}
+
+	// All non-folded players must match the high bet
+	for _, p := range g.table.Players() {
+		if !p.HasFolded && p.CurrentBet != g.CurrentHighBet {
+			return false
+		}
+	}
+	return true
+}
+
+// checkForLastPlayerStanding awards the pot immediately if only 1 player remains.
+// Returns true if the hand ended.
+func (g *Game) checkForLastPlayerStanding() bool {
+	active := g.activePlayers()
+	if active > 1 {
+		return false
+	}
+
+	// Find the surviving player
+	for _, p := range g.table.Players() {
+		if !p.HasFolded {
+			p.Balance += g.Pot
+			logrus.Infof("[%s] All opponents folded. Player %s wins pot of %d", g.listenAddr, p.addr, g.Pot)
+			g.Pot = 0
+			break
+		}
+	}
+
+	// Reset for next hand
+	g.resetHandState()
+	g.currentDealer = int32(g.getNextDealer())
+	g.SetReady()
+	return true
+}
+
+// resetHandState clears all per-hand state for a fresh deal.
+func (g *Game) resetHandState() {
+	g.HoleCards = nil
+	g.CommunityCards = nil
+	g.ShowdownHands = make(map[string][]deck.Card)
+	g.EncryptedDeck = nil
+	g.DeckPointer = 0
+	g.ringCounter = 0
+	g.CurrentHighBet = 0
+	g.ActionsThisRound = 0
+
+	for _, p := range g.table.Players() {
+		p.HasFolded = false
+		p.CurrentBet = 0
+		p.currentAction = PlayerActionNone
+	}
+}
+
+// resetStreetBets resets per-street betting state while preserving the pot.
+func (g *Game) resetStreetBets() {
+	g.CurrentHighBet = 0
+	g.ActionsThisRound = 0
+	for _, p := range g.table.Players() {
+		p.CurrentBet = 0
+		if !p.HasFolded {
+			p.currentAction = PlayerActionNone
+		}
+	}
 }
 
 func (g *Game) handlePlayerAction(from string, action MessagePlayerAction) error {
@@ -277,7 +400,7 @@ func (g *Game) handlePlayerAction(from string, action MessagePlayerAction) error
 		return fmt.Errorf("player (%s) taking action before his turn", from)
 	}
 
-	if action.CurrentGameStatus != GameStatus(g.currentStatus.Get()) && !g.isFromCurrentDealer(from) {
+	if action.CurrentGameStatus != GameStatus(g.currentStatus) {
 		return fmt.Errorf("player (%s) has not the correct game status (%s)", from, action.CurrentGameStatus)
 	}
 
@@ -287,17 +410,24 @@ func (g *Game) handlePlayerAction(from string, action MessagePlayerAction) error
 
 	g.recvPlayerActions.addAction(from, action)
 
-	if g.playersList.get(g.currentDealer.Get()) == from {
-		g.advanceToNexRound() // Automatically steps if the dealer acts
+	logrus.WithFields(logrus.Fields{
+		"we":     g.listenAddr,
+		"from":   from,
+		"action": action.Action,
+		"value":  action.Value,
+		"pot":    g.Pot,
+	}).Info("recv player action")
+
+	// Check if everyone except one has folded
+	if g.checkForLastPlayerStanding() {
+		return nil
 	}
 
 	g.incNextPlayer()
 
-	logrus.WithFields(logrus.Fields{
-		"we":     g.listenAddr,
-		"from":   from,
-		"action": action,
-	}).Info("recv player action")
+	if g.isBettingRoundComplete() {
+		g.advanceToNexRound()
+	}
 
 	return nil
 }
@@ -311,26 +441,32 @@ func (g *Game) TakeAction(action PlayerAction, value int) error {
 		return err
 	}
 
-	g.currentPlayerAction.Set((int32)(action))
+	g.currentPlayerAction = (int32)(action)
 
-	g.incNextPlayer()
-
-	if g.listenAddr == g.playersList.get(g.currentDealer.Get()) {
-		g.advanceToNexRound() // Automatically steps if the dealer acts
-	}
-
+	// Broadcast action to peers
 	a := MessagePlayerAction{
 		Action:            action,
-		CurrentGameStatus: GameStatus(g.currentStatus.Get()),
+		CurrentGameStatus: GameStatus(g.currentStatus),
 		Value:             value,
 	}
 	g.sendToPlayers(a, g.getOtherPlayers()...)
+
+	// Check if everyone except one has folded
+	if g.checkForLastPlayerStanding() {
+		return nil
+	}
+
+	g.incNextPlayer()
+
+	if g.isBettingRoundComplete() {
+		g.advanceToNexRound()
+	}
 
 	return nil
 }
 
 func (g *Game) getNextGameStatus() GameStatus {
-	status := GameStatus(g.currentStatus.Get())
+	status := GameStatus(g.currentStatus)
 	switch status {
 	case GameStatusPreFlop:
 		return GameStatusFlop
@@ -348,15 +484,16 @@ func (g *Game) getNextGameStatus() GameStatus {
 
 func (g *Game) advanceToNexRound() {
 	g.recvPlayerActions.clear()
-	g.currentPlayerAction.Set(int32(PlayerActionNone))
+	g.currentPlayerAction = int32(PlayerActionNone)
+	g.resetStreetBets()
 
-	if GameStatus(g.currentStatus.Get()) == GameStatusRiver {
+	if GameStatus(g.currentStatus) == GameStatusRiver {
 		g.Showdown()
 		return
 	}
 
 	nextStatus := g.getNextGameStatus()
-	g.currentStatus.Set(int32(nextStatus))
+	g.currentStatus = int32(nextStatus)
 
 	// Only the dealer initiates the community card sequential unspooling ring
 	_, isDealer := g.getCurrentDealerAddr()
@@ -419,8 +556,9 @@ func (g *Game) Showdown() {
 	// (In a real implementation, we would wait for all MessageShowHand messages first.
 	// For now, this evaluates with whatever hands we have.)
 	go func() {
-		// Wait a moment for all ShowHand messages to arrive
 		time.Sleep(3 * time.Second)
+		g.mu.Lock()
+		defer g.mu.Unlock()
 		g.evaluateShowdown()
 	}()
 }
@@ -443,7 +581,6 @@ func (g *Game) evaluateShowdown() {
 		if len(holeCards) < 2 {
 			continue
 		}
-		// Combine 2 hole cards + 5 community cards for evaluation
 		allCards := make([]deck.Card, 0, 7)
 		allCards = append(allCards, holeCards...)
 		allCards = append(allCards, g.CommunityCards...)
@@ -473,25 +610,31 @@ func (g *Game) evaluateShowdown() {
 		g.listenAddr, winnerAddr, bestScore, g.Pot, winner.Balance)
 	g.Pot = 0
 
-	// Reset for next hand
-	g.HoleCards = nil
-	g.CommunityCards = nil
-	g.ShowdownHands = make(map[string][]deck.Card)
-	g.EncryptedDeck = nil
-	g.DeckPointer = 0
-	g.ringCounter = 0
-
-	g.currentDealer.Set(int32(g.getNextDealer()))
+	g.resetHandState()
+	g.currentDealer = int32(g.getNextDealer())
 	g.SetReady()
 }
 
+// incNextPlayer advances the turn to the next non-folded player.
 func (g *Game) incNextPlayer() {
-	if g.playersList.len()-1 == int(g.currentPlayerTurn.Get()) {
-		g.currentPlayerTurn.Set(0)
+	numPlayers := g.playersList.len()
+	if numPlayers == 0 {
 		return
 	}
 
-	g.currentPlayerTurn.Inc()
+	current := int(g.currentPlayerTurn)
+	for i := 0; i < numPlayers; i++ {
+		next := (current + 1 + i) % numPlayers
+		addr := g.playersList.get(next)
+		player, err := g.table.GetPlayer(addr)
+		if err != nil {
+			continue
+		}
+		if !player.HasFolded {
+			g.currentPlayerTurn = int32(next)
+			return
+		}
+	}
 }
 
 func (g *Game) SetStatus(s GameStatus) {
@@ -505,13 +648,13 @@ func (g *Game) setStatus(s GameStatus) {
 	}
 
 	// Only update the status when the status is different.
-	if GameStatus(g.currentStatus.Get()) != s {
-		g.currentStatus.Set(int32(s))
+	if GameStatus(g.currentStatus) != s {
+		g.currentStatus = int32(s)
 	}
 }
 
 func (g *Game) getCurrentDealerAddr() (string, bool) {
-	currentDealerAddr := g.playersList.get(g.currentDealer.Get())
+	currentDealerAddr := g.playersList.get(g.currentDealer)
 
 	return currentDealerAddr, g.listenAddr == currentDealerAddr
 }
@@ -696,7 +839,7 @@ func (g *Game) InitiateShuffleAndDeal() {
 }
 
 func (g *Game) maybeDeal() {
-	if GameStatus(g.currentStatus.Get()) == GameStatusPlayerReady {
+	if GameStatus(g.currentStatus) == GameStatusPlayerReady {
 		g.InitiateShuffleAndDeal()
 	}
 }
@@ -719,9 +862,9 @@ func (g *Game) SetPlayerReady(addr string) {
 	// we need to check if we are the dealer of the current round.
 	if _, areWeDealer := g.getCurrentDealerAddr(); areWeDealer {
 		go func() {
-			// if the game can start we will wait another
-			// N amount of seconds to actually start dealing
 			time.Sleep(5 * time.Second)
+			g.mu.Lock()
+			defer g.mu.Unlock()
 			g.maybeDeal()
 		}()
 	}
@@ -766,25 +909,25 @@ func (g *Game) RemovePlayer(addr string) {
 		return
 	}
 
-	currTurn := int(g.currentPlayerTurn.Get())
+	currTurn := int(g.currentPlayerTurn)
 	if idx < currTurn {
-		g.currentPlayerTurn.Set(int32(currTurn - 1))
+		g.currentPlayerTurn = int32(currTurn - 1)
 	} else if idx == currTurn {
 		if currTurn >= g.playersList.len() {
-			g.currentPlayerTurn.Set(0)
+			g.currentPlayerTurn = 0
 		}
 	}
 
-	dealerIdx := int(g.currentDealer.Get())
+	dealerIdx := int(g.currentDealer)
 	if idx < dealerIdx {
-		g.currentDealer.Set(int32(dealerIdx - 1))
+		g.currentDealer = int32(dealerIdx - 1)
 	} else if idx == dealerIdx {
 		if dealerIdx >= g.playersList.len() {
-			g.currentDealer.Set(0)
+			g.currentDealer = 0
 		}
 	}
 
-	if GameStatus(g.currentStatus.Get()) != GameStatusConnected && GameStatus(g.currentStatus.Get()) != GameStatusPlayerReady {
+	if GameStatus(g.currentStatus) != GameStatusConnected && GameStatus(g.currentStatus) != GameStatusPlayerReady {
 		if wasCurrentTurn {
 			logrus.Info("disconnected player was the current turn; skipping to next turn")
 			if wasDealer {
@@ -811,7 +954,7 @@ func (g *Game) loop() {
 		logrus.WithFields(logrus.Fields{
 			"we":             g.listenAddr,
 			"playersList":    g.playersList.List(),
-			"gameState":      GameStatus(g.currentStatus.Get()),
+			"gameState":      GameStatus(g.currentStatus),
 			"currentDealer":  currentDealerAddr,
 			"nextPlayerTurn": g.currentPlayerTurn,
 		}).Info()
@@ -855,7 +998,7 @@ func (g *Game) getPositionOnTable() int {
 // }
 
 func (g *Game) getNextDealer() int {
-	current := int(g.currentDealer.Get())
+	current := int(g.currentDealer)
 	if g.playersList.len() == 0 {
 		return 0
 	}
