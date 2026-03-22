@@ -335,6 +335,14 @@ func (s *Server) handleMessage(msg *Message) error {
 		return s.handleMsgReady(msg.From)
 	case MessagePlayerAction:
 		return s.handleGetMsgPlayerAction(msg.From, v)
+	case MessageDeckFinal:
+		return s.gameState.HandleMessageDeckFinal(msg.From, v)
+	case MessagePassUnlockCard:
+		return s.gameState.HandlePassUnlockCard(msg.From, v)
+	case MessageRevealCommunity:
+		return s.gameState.HandleRevealCommunity(msg.From, v)
+	case MessageShowHand:
+		return s.gameState.HandleShowHand(msg.From, v)
 	}
 	return nil
 }
@@ -387,4 +395,8 @@ func init() {
 	gob.Register(MessageReady{})
 	gob.Register(MessagePreFlop{})
 	gob.Register(MessagePlayerAction{})
+	gob.Register(MessageDeckFinal{})
+	gob.Register(MessagePassUnlockCard{})
+	gob.Register(MessageRevealCommunity{})
+	gob.Register(MessageShowHand{})
 }

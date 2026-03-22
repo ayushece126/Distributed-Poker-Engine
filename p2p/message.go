@@ -1,5 +1,7 @@
 package p2p
 
+import "github.com/anthdm/ggpoker/deck"
+
 type Message struct {
 	Payload any
 	From    string
@@ -46,6 +48,27 @@ type MessagePeerList struct {
 
 type MessageEncDeck struct {
 	Deck [][]byte
+}
+
+type MessageDeckFinal struct {
+	Deck [][]byte
+}
+
+type MessagePassUnlockCard struct {
+	RingID     string // Unique ID to distinguish concurrent rings
+	InitNode   string
+	TargetNode string
+	Indexes    []int
+	Payloads   [][]byte
+}
+
+type MessageRevealCommunity struct {
+	Cards []deck.Card
+}
+
+type MessageShowHand struct {
+	Addr  string
+	Cards  []deck.Card
 }
 
 type MessageReady struct{}

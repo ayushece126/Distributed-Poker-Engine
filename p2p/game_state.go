@@ -2,12 +2,14 @@ package p2p
 
 import (
 	"fmt"
+	"math/rand"
 	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/anthdm/ggpoker/deck"
 	"github.com/sirupsen/logrus"
 )
 
@@ -205,9 +207,23 @@ type Game struct {
 
 	table *Table
 	Pot   int
+
+	// Mental Poker State
+	Keys           *KeyPair
+	EncryptedDeck  [][]byte
+	DeckPointer    int
+	HoleCards      []deck.Card                // Our private hole cards
+	CommunityCards []deck.Card                // Shared community cards
+	ShowdownHands  map[string][]deck.Card     // addr -> revealed hole cards from showdown
+	ringCounter    int                        // increments to generate unique ring IDs
 }
 
 func NewGame(addr string, bc chan BroadcastTo) *Game {
+	keys, err := GenerateKeys()
+	if err != nil {
+		panic(fmt.Sprintf("failed to generate Mental Poker keys: %s", err))
+	}
+
 	g := &Game{
 		listenAddr:          addr,
 		broadcastch:         bc,
@@ -219,6 +235,8 @@ func NewGame(addr string, bc chan BroadcastTo) *Game {
 		recvPlayerActions:   NewPlayerActionsRevc(),
 		currentPlayerTurn:   NewAtomicInt(0),
 		table:               NewTable(6),
+		Keys:                keys,
+		ShowdownHands:       make(map[string][]deck.Card),
 	}
 
 	g.playersList.add(addr)
@@ -336,33 +354,134 @@ func (g *Game) advanceToNexRound() {
 		g.Showdown()
 		return
 	}
-	g.currentStatus.Set(int32(g.getNextGameStatus()))
+
+	nextStatus := g.getNextGameStatus()
+	g.currentStatus.Set(int32(nextStatus))
+
+	// Only the dealer initiates the community card sequential unspooling ring
+	_, isDealer := g.getCurrentDealerAddr()
+	if isDealer {
+		var indexes []int
+		if nextStatus == GameStatusFlop {
+			g.DeckPointer++ // Burn 1 card
+			indexes = []int{g.DeckPointer, g.DeckPointer + 1, g.DeckPointer + 2}
+			g.DeckPointer += 3
+		} else if nextStatus == GameStatusTurn || nextStatus == GameStatusRiver {
+			g.DeckPointer++ // Burn 1 card
+			indexes = []int{g.DeckPointer}
+			g.DeckPointer++
+		}
+
+		if len(indexes) > 0 {
+			g.ringCounter++
+			ringID := fmt.Sprintf("%s-community-%d", g.listenAddr, g.ringCounter)
+
+			logrus.Infof("[%s] Dealer initiating community sequential unspooling for %v", g.listenAddr, indexes)
+			payloads := make([][]byte, len(indexes))
+			for i, idx := range indexes {
+				payloads[i] = g.EncryptedDeck[idx]
+			}
+			nextPlayer, _ := g.table.GetPlayerAfter(g.listenAddr)
+			g.sendToPlayers(MessagePassUnlockCard{
+				RingID:     ringID,
+				InitNode:   g.listenAddr,
+				TargetNode: "COMMUNITY",
+				Indexes:    indexes,
+				Payloads:   payloads,
+			}, nextPlayer.addr)
+		}
+	} else {
+		// Non-dealers sync their pointer to stay aligned: burn 1 + deal N
+		if nextStatus == GameStatusFlop {
+			g.DeckPointer += 4 // Burn 1 + Flop 3
+		} else if nextStatus == GameStatusTurn || nextStatus == GameStatusRiver {
+			g.DeckPointer += 2 // Burn 1 + Deal 1
+		}
+	}
 }
 
 func (g *Game) Showdown() {
-	// TODO: P2P Showdown Logic
-	// 1. Exchange encryption keys over the network to reveal hole cards.
-	// 2. Fetch 5 community cards.
-	// 3. Run deck.Evaluate() on each active player's 7 cards.
-	// 4. Find the player with the highest Hand.Score
-	// 5. Award the Pot.
-
 	logrus.WithFields(logrus.Fields{
 		"pot": g.Pot,
 		"we":  g.listenAddr,
-	}).Info("Executing showdown and awarding pot")
+	}).Info("entering showdown")
 
-	// For now, we simply award the pot to the current dealer to prevent chip leaking
-	dealerAddr := g.playersList.get(g.currentDealer.Get())
-	currentDealer, _ := g.table.GetPlayer(dealerAddr)
-	if currentDealer != nil {
-		currentDealer.Balance += g.Pot
+	// Step 1: Broadcast our hole cards so every node can independently verify
+	g.sendToPlayers(MessageShowHand{
+		Addr:  g.listenAddr,
+		Cards: g.HoleCards,
+	}, g.getOtherPlayers()...)
+
+	// Store our own hand into the ShowdownHands map for evaluation
+	g.ShowdownHands[g.listenAddr] = g.HoleCards
+
+	// Step 2: Evaluate locally once all hands are collected
+	// (In a real implementation, we would wait for all MessageShowHand messages first.
+	// For now, this evaluates with whatever hands we have.)
+	go func() {
+		// Wait a moment for all ShowHand messages to arrive
+		time.Sleep(3 * time.Second)
+		g.evaluateShowdown()
+	}()
+}
+
+func (g *Game) HandleShowHand(from string, msg MessageShowHand) error {
+	g.ShowdownHands[msg.Addr] = msg.Cards
+	logrus.Infof("[%s] Received showdown hand from %s: %v", g.listenAddr, msg.Addr, msg.Cards)
+	return nil
+}
+
+func (g *Game) evaluateShowdown() {
+	if len(g.CommunityCards) < 5 {
+		logrus.Warnf("[%s] Showdown called with only %d community cards", g.listenAddr, len(g.CommunityCards))
 	}
+
+	var bestScore int64
+	var winnerAddr string
+
+	for addr, holeCards := range g.ShowdownHands {
+		if len(holeCards) < 2 {
+			continue
+		}
+		// Combine 2 hole cards + 5 community cards for evaluation
+		allCards := make([]deck.Card, 0, 7)
+		allCards = append(allCards, holeCards...)
+		allCards = append(allCards, g.CommunityCards...)
+		result := deck.Evaluate(allCards)
+
+		logrus.Infof("[%s] Player %s has hand: %s (score: %d)", g.listenAddr, addr, result.Rank, result.Score)
+
+		if result.Score > bestScore {
+			bestScore = result.Score
+			winnerAddr = addr
+		}
+	}
+
+	if winnerAddr == "" {
+		logrus.Warnf("[%s] No valid hands found in showdown", g.listenAddr)
+		return
+	}
+
+	winner, err := g.table.GetPlayer(winnerAddr)
+	if err != nil {
+		logrus.Errorf("[%s] Could not find winner %s on table: %s", g.listenAddr, winnerAddr, err)
+		return
+	}
+
+	winner.Balance += g.Pot
+	logrus.Infof("[%s] Showdown winner: %s with score %d. Pot %d awarded. New balance: %d",
+		g.listenAddr, winnerAddr, bestScore, g.Pot, winner.Balance)
 	g.Pot = 0
 
-	// Advance the dealer button to the next person
-	g.currentDealer.Set(int32(g.getNextDealer()))
+	// Reset for next hand
+	g.HoleCards = nil
+	g.CommunityCards = nil
+	g.ShowdownHands = make(map[string][]deck.Card)
+	g.EncryptedDeck = nil
+	g.DeckPointer = 0
+	g.ringCounter = 0
 
+	g.currentDealer.Set(int32(g.getNextDealer()))
 	g.SetReady()
 }
 
@@ -397,6 +516,104 @@ func (g *Game) getCurrentDealerAddr() (string, bool) {
 	return currentDealerAddr, g.listenAddr == currentDealerAddr
 }
 
+func (g *Game) LockAndShuffle(input [][]byte) [][]byte {
+	out := make([][]byte, len(input))
+	copy(out, input)
+
+	// Fisher-Yates shuffle FIRST, then encrypt each card
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for i := len(out) - 1; i > 0; i-- {
+		j := rng.Intn(i + 1)
+		out[i], out[j] = out[j], out[i]
+	}
+
+	// Encrypt every card with our key
+	for i := range out {
+		out[i] = Encrypt(out[i], g.Keys.EncryptKey)
+	}
+	return out
+}
+
+// nextRingID generates a unique ring identifier to prevent collisions between concurrent rings.
+func (g *Game) nextRingID(label string) string {
+	g.ringCounter++
+	return fmt.Sprintf("%s-%s-%d", g.listenAddr, label, g.ringCounter)
+}
+
+func (g *Game) HandleMessageDeckFinal(from string, msg MessageDeckFinal) error {
+	g.EncryptedDeck = msg.Deck
+	g.DeckPointer = 0
+
+	g.setStatus(GameStatusPreFlop)
+	g.table.SetPlayerStatus(g.listenAddr, GameStatusPreFlop)
+
+	logrus.Infof("[%s] Received final locked deck! Transitioning to PreFlop.", g.listenAddr)
+
+	myIdx := g.playersList.getIndex(g.listenAddr)
+	indexes := []int{myIdx * 2, myIdx*2 + 1}
+	g.DeckPointer += g.playersList.len() * 2
+
+	payloads := make([][]byte, len(indexes))
+	for i, idx := range indexes {
+		payloads[i] = g.EncryptedDeck[idx]
+	}
+
+	ringID := g.nextRingID("hole")
+	nextPlayer, _ := g.table.GetPlayerAfter(g.listenAddr)
+	g.sendToPlayers(MessagePassUnlockCard{
+		RingID:     ringID,
+		InitNode:   g.listenAddr,
+		TargetNode: g.listenAddr,
+		Indexes:    indexes,
+		Payloads:   payloads,
+	}, nextPlayer.addr)
+
+	return nil
+}
+
+func (g *Game) HandlePassUnlockCard(from string, msg MessagePassUnlockCard) error {
+	// Mathematically remove our layer of encryption
+	for i := range msg.Payloads {
+		msg.Payloads[i] = Decrypt(msg.Payloads[i], g.Keys.DecryptKey)
+	}
+
+	// Has the package travelled all the way around the ring back to the initiator?
+	if msg.InitNode == g.listenAddr {
+		resolvedCards := make([]deck.Card, 0, len(msg.Indexes))
+		for i, idx := range msg.Indexes {
+			finalBytes := msg.Payloads[i]
+			if len(finalBytes) > 0 {
+				card := IntToCard(int(finalBytes[len(finalBytes)-1]))
+				resolvedCards = append(resolvedCards, card)
+				logrus.Infof("[%s] Ring %s resolved card at index %d: %v", g.listenAddr, msg.RingID, idx, card)
+			}
+		}
+
+		if msg.TargetNode == g.listenAddr {
+			// These are our private hole cards — store them securely
+			g.HoleCards = resolvedCards
+			logrus.Infof("[%s] Stored private hole cards: %v", g.listenAddr, g.HoleCards)
+		} else if msg.TargetNode == "COMMUNITY" {
+			// Community cards resolved — broadcast to all peers
+			g.CommunityCards = append(g.CommunityCards, resolvedCards...)
+			logrus.Infof("[%s] Stored community cards (total %d): %v", g.listenAddr, len(g.CommunityCards), g.CommunityCards)
+			g.sendToPlayers(MessageRevealCommunity{Cards: resolvedCards}, g.getOtherPlayers()...)
+		}
+		return nil
+	}
+
+	// The ring continues — pass to the next player
+	nextPlayer, _ := g.table.GetPlayerAfter(g.listenAddr)
+	g.sendToPlayers(msg, nextPlayer.addr)
+	return nil
+}
+
+func (g *Game) HandleRevealCommunity(from string, msg MessageRevealCommunity) error {
+	g.CommunityCards = append(g.CommunityCards, msg.Cards...)
+	logrus.Infof("[%s] Received community cards (total %d): %v", g.listenAddr, len(g.CommunityCards), g.CommunityCards)
+	return nil
+}
+
 func (g *Game) ShuffleAndEncrypt(from string, deck [][]byte) error {
 	prevPlayer, err := g.table.GetPlayerBefore(g.listenAddr)
 	if err != nil {
@@ -406,17 +623,40 @@ func (g *Game) ShuffleAndEncrypt(from string, deck [][]byte) error {
 		return fmt.Errorf("received encrypted deck from the wrong player (%s) should be (%s)", from, prevPlayer.addr)
 	}
 
-	// If we are the dealer and we received a message from the previous player on the table
-	// we advance to the next round.
 	_, isDealer := g.getCurrentDealerAddr()
 	if isDealer && from == prevPlayer.addr {
+		g.EncryptedDeck = deck
+		g.DeckPointer = 0
+
+		logrus.Infof("[%s] Mathematical Ring Loop Complete. Broadcasting finalized deck FIRST.", g.listenAddr)
+		g.sendToPlayers(MessageDeckFinal{Deck: deck}, g.getOtherPlayers()...)
+
+		// NOW change local stage
 		g.setStatus(GameStatusPreFlop)
 		g.table.SetPlayerStatus(g.listenAddr, GameStatusPreFlop)
-		g.sendToPlayers(MessagePreFlop{}, g.getOtherPlayers()...)
+
+		myIdx := g.playersList.getIndex(g.listenAddr)
+		indexes := []int{myIdx * 2, myIdx*2 + 1}
+		g.DeckPointer += g.playersList.len() * 2
+
+		// Initiate unspooling for the dealer's own hole cards
+		ringID := g.nextRingID("hole")
+		payloads := make([][]byte, len(indexes))
+		for i, idx := range indexes {
+			payloads[i] = g.EncryptedDeck[idx]
+		}
+		nextPlayer, _ := g.table.GetPlayerAfter(g.listenAddr)
+		g.sendToPlayers(MessagePassUnlockCard{
+			RingID:     ringID,
+			InitNode:   g.listenAddr,
+			TargetNode: g.listenAddr,
+			Indexes:    indexes,
+			Payloads:   payloads,
+		}, nextPlayer.addr)
+		
 		return nil
 	}
 
-	// dealToPlayer := g.playersList.get(g.getNextPositionOnTable())
 	dealToPlayer, err := g.table.GetPlayerAfter(g.listenAddr)
 	if err != nil {
 		panic(err)
@@ -426,33 +666,33 @@ func (g *Game) ShuffleAndEncrypt(from string, deck [][]byte) error {
 		"recvFromPlayer":  from,
 		"we":              g.listenAddr,
 		"dealingToPlayer": dealToPlayer.addr,
-	}).Info("received cards and going to shuffle")
+	}).Info("received cards and independently encrypting layer for next player")
 
-	// TODO:(@anthdm) encryption and shuffle
-	g.sendToPlayers(MessageEncDeck{Deck: [][]byte{}}, dealToPlayer.addr)
+	locked := g.LockAndShuffle(deck)
+
+	g.sendToPlayers(MessageEncDeck{Deck: locked}, dealToPlayer.addr)
 	g.setStatus(GameStatusDealing)
 
 	return nil
 }
 
 func (g *Game) InitiateShuffleAndDeal() {
-	fmt.Println("==================================================================")
-	fmt.Println(g.listenAddr)
-	fmt.Println("==================================================================")
-
-	// dealToPlayerAddr := g.playersList.get(g.getNextPositionOnTable())
 	dealToPlayer, err := g.table.GetPlayerAfter(g.listenAddr)
 	if err != nil {
 		panic(err)
 	}
 
 	g.setStatus(GameStatusDealing)
-	g.sendToPlayers(MessageEncDeck{Deck: [][]byte{}}, dealToPlayer.addr)
+
+	plain := GeneratePlaintextDeck()
+	locked := g.LockAndShuffle(plain)
 
 	logrus.WithFields(logrus.Fields{
 		"we": g.listenAddr,
 		"to": dealToPlayer.addr,
-	}).Info("dealing cards")
+	}).Info("Generated native Galois deck array. Passing to first node for encryption layer.")
+
+	g.sendToPlayers(MessageEncDeck{Deck: locked}, dealToPlayer.addr)
 }
 
 func (g *Game) maybeDeal() {
