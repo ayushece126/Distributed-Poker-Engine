@@ -41,66 +41,70 @@ func main() {
 		time.Sleep(time.Second * 2)
 		http.Get("http://localhost:16001/ready")
 
-		// // [3000:D, 4000:sb, 6000:bb, 7000]
-		// PREFLOP
-		time.Sleep(time.Second * 10)
+		// Wait for dealer's 5s timer + the initial encrypt/decrypt hole cards ring
+		// This takes some time over the network
+		time.Sleep(time.Second * 12)
 
+		// --- PREFLOP ---
+		// Everyone checks
 		http.Get("http://localhost:14001/check")
-
-		time.Sleep(time.Second * 2)
+		time.Sleep(time.Second * 1)
 		http.Get("http://localhost:15001/check")
-
-		time.Sleep(time.Second * 2)
+		time.Sleep(time.Second * 1)
 		http.Get("http://localhost:16001/check")
-
-		time.Sleep(time.Second * 2)
+		time.Sleep(time.Second * 1)
 		http.Get("http://localhost:13001/check")
 
-		// FLOP
-		time.Sleep(time.Second * 5)
+		// Wait for the Flop 3 community cards to be unspooled mathematically
+		time.Sleep(time.Second * 8)
+
+		// --- FLOP ---
+		// 14000 folds
+		// 15000 bets 100
+		// 16000 calls the 100
+		// 13000 calls the 100
 		http.Get("http://localhost:14001/fold")
-
-		time.Sleep(time.Second * 2)
+		time.Sleep(time.Second * 1)
 		http.Get("http://localhost:15001/bet/100")
-
-		time.Sleep(time.Second * 2)
+		time.Sleep(time.Second * 1)
 		http.Get("http://localhost:16001/call")
-
-		time.Sleep(time.Second * 2)
+		time.Sleep(time.Second * 1)
 		http.Get("http://localhost:13001/call")
 
-		// // TURN
-		// time.Sleep(time.Second * 2)
-		// http.Get("http://localhost:4001/fold")
+		// Wait for the Turn 1 community card to be unspooled
+		time.Sleep(time.Second * 5)
 
-		// time.Sleep(time.Second * 2)
-		// http.Get("http://localhost:6001/fold")
+		// --- TURN ---
+		// 14000 is folded.
+		// 15000 checks
+		// 16000 bets 200
+		// 13000 calls 200
+		// 15000 (who checked earlier) now folds to the bet
+		http.Get("http://localhost:15001/check")
+		time.Sleep(time.Second * 1)
+		http.Get("http://localhost:16001/bet/200")
+		time.Sleep(time.Second * 1)
+		http.Get("http://localhost:13001/call")
+		time.Sleep(time.Second * 1)
+		http.Get("http://localhost:15001/fold")
 
-		// time.Sleep(time.Second * 2)
-		// http.Get("http://localhost:7001/fold")
+		// Wait for the River 1 community card to be unspooled
+		time.Sleep(time.Second * 5)
 
-		// time.Sleep(time.Second * 2)
-		// http.Get("http://localhost:3001/fold")
+		// --- RIVER ---
+		// Only 16000 and 13000 are left.
+		// Both check, leading to a Showdown!
+		http.Get("http://localhost:16001/check")
+		time.Sleep(time.Second * 1)
+		http.Get("http://localhost:13001/check")
 
-		// // RIVER
-		// time.Sleep(time.Second * 2)
-		// http.Get("http://localhost:4001/fold")
-
-		// time.Sleep(time.Second * 2)
-		// http.Get("http://localhost:6001/fold")
-
-		// time.Sleep(time.Second * 2)
-		// http.Get("http://localhost:7001/fold")
-
-		// time.Sleep(time.Second * 2)
-		// http.Get("http://localhost:3001/fold")
-
+		// The game will automatically transition to showdown, calculate the hands, and award the pot!
 	}()
 
 	time.Sleep(time.Millisecond * 200)
 	playerB.Connect(playerA.ListenAddr)
 
-	time.Sleep(time.Millisecond)
+	time.Sleep(time.Millisecond * 200)
 	playerC.Connect(playerB.ListenAddr)
 
 	time.Sleep(time.Millisecond * 200)
