@@ -99,7 +99,6 @@ func (p *PlayersList) Less(i, j int) bool {
 	return portI < portJ
 }
 
-
 type PlayerActionsRecv struct {
 	mu          sync.RWMutex
 	recvActions map[string]MessagePlayerAction
@@ -159,8 +158,8 @@ func (pr *PlayersReady) clear() {
 }
 
 type Game struct {
-	mu         sync.Mutex // guards all mutable game state
-	listenAddr string
+	mu          sync.Mutex // guards all mutable game state
+	listenAddr  string
 	broadcastch chan BroadcastTo
 
 	currentStatus       int32
@@ -198,15 +197,15 @@ func NewGame(addr string, bc chan BroadcastTo) *Game {
 	}
 
 	g := &Game{
-		listenAddr:      addr,
-		broadcastch:     bc,
-		currentStatus:   int32(GameStatusConnected),
-		playersReady:    NewPlayersReady(),
-		playersList:     NewPlayersList(),
+		listenAddr:        addr,
+		broadcastch:       bc,
+		currentStatus:     int32(GameStatusConnected),
+		playersReady:      NewPlayersReady(),
+		playersList:       NewPlayersList(),
 		recvPlayerActions: NewPlayerActionsRevc(),
-		table:           NewTable(6),
-		Keys:            keys,
-		ShowdownHands:   make(map[string][]deck.Card),
+		table:             NewTable(6),
+		Keys:              keys,
+		ShowdownHands:     make(map[string][]deck.Card),
 	}
 
 	g.playersList.add(addr)
@@ -250,6 +249,7 @@ func (g *Game) applyPlayerAction(addr string, action PlayerAction, value int) er
 	case PlayerActionFold:
 		player.HasFolded = true
 		player.currentAction = PlayerActionFold
+		g.ActionsThisRound++
 		logrus.Infof("[%s] Player %s folded", g.listenAddr, addr)
 
 	case PlayerActionCheck:
@@ -258,6 +258,7 @@ func (g *Game) applyPlayerAction(addr string, action PlayerAction, value int) er
 				addr, g.CurrentHighBet, player.CurrentBet)
 		}
 		player.currentAction = PlayerActionCheck
+		g.ActionsThisRound++
 
 	case PlayerActionBet:
 		if g.CurrentHighBet != 0 {
@@ -274,7 +275,7 @@ func (g *Game) applyPlayerAction(addr string, action PlayerAction, value int) er
 		player.CurrentBet += value
 		g.Pot += value
 		g.CurrentHighBet = player.CurrentBet
-		g.ActionsThisRound = 1 // Reset: everyone else must act again
+		g.ActionsThisRound = 1 // Reset: bettor counts as the first action
 		player.currentAction = PlayerActionBet
 
 	case PlayerActionCall:
@@ -283,13 +284,13 @@ func (g *Game) applyPlayerAction(addr string, action PlayerAction, value int) er
 			return fmt.Errorf("player %s has nothing to call (already matched high bet)", addr)
 		}
 		if player.Balance < callAmount {
-			// All-in: call with whatever they have
 			callAmount = player.Balance
 		}
 		player.Balance -= callAmount
 		player.CurrentBet += callAmount
 		g.Pot += callAmount
 		player.currentAction = PlayerActionCall
+		g.ActionsThisRound++
 
 	case PlayerActionRaise:
 		if g.CurrentHighBet == 0 {
@@ -307,14 +308,13 @@ func (g *Game) applyPlayerAction(addr string, action PlayerAction, value int) er
 		player.CurrentBet += value
 		g.Pot += value
 		g.CurrentHighBet = player.CurrentBet
-		g.ActionsThisRound = 1 // Reset: everyone else must respond
+		g.ActionsThisRound = 1 // Reset: raiser counts as the first action
 		player.currentAction = PlayerActionRaise
 
 	default:
 		return fmt.Errorf("unknown player action: %d", action)
 	}
 
-	g.ActionsThisRound++
 	return nil
 }
 
@@ -789,6 +789,9 @@ func (g *Game) ShuffleAndEncrypt(from string, deck [][]byte) error {
 			payloads[i] = g.EncryptedDeck[idx]
 		}
 		nextPlayer, _ := g.table.GetPlayerAfter(g.listenAddr)
+
+		//concurrent writes(the final deck broadcast and the MessagePassUnlockCard) to the :14000 by the dealer makes the actual bytes garbage.
+		time.Sleep(time.Millisecond * 50)
 		g.sendToPlayers(MessagePassUnlockCard{
 			RingID:     ringID,
 			InitNode:   g.listenAddr,
@@ -796,7 +799,7 @@ func (g *Game) ShuffleAndEncrypt(from string, deck [][]byte) error {
 			Indexes:    indexes,
 			Payloads:   payloads,
 		}, nextPlayer.addr)
-		
+
 		return nil
 	}
 
@@ -844,8 +847,7 @@ func (g *Game) maybeDeal() {
 	}
 }
 
-// SetPlayerReady is getting called when we receive a ready message
-// from a player in the network.
+// SetPlayerReady is getting called when we receive a ready message from a player in the network.
 func (g *Game) SetPlayerReady(addr string) {
 	tablePos := g.playersList.getIndex(addr)
 	g.table.AddPlayerOnPosition(addr, tablePos)
@@ -860,7 +862,7 @@ func (g *Game) SetPlayerReady(addr string) {
 	}
 
 	// we need to check if we are the dealer of the current round.
-	if _, areWeDealer := g.getCurrentDealerAddr(); areWeDealer {
+	if _, areWeDealer := g.getCurrentDealerAddr(); areWeDealer && g.table.LenPlayers() == g.playersList.len() {
 		go func() {
 			time.Sleep(5 * time.Second)
 			g.mu.Lock()
@@ -894,7 +896,6 @@ func (g *Game) RemovePlayer(addr string) {
 	}
 
 	wasCurrentTurn := g.canTakeAction(addr)
-	wasDealer := g.isFromCurrentDealer(addr)
 
 	g.playersList.remove(addr)
 	g.table.RemovePlayerByAddr(addr)
@@ -929,8 +930,12 @@ func (g *Game) RemovePlayer(addr string) {
 
 	if GameStatus(g.currentStatus) != GameStatusConnected && GameStatus(g.currentStatus) != GameStatusPlayerReady {
 		if wasCurrentTurn {
-			logrus.Info("disconnected player was the current turn; skipping to next turn")
-			if wasDealer {
+			logrus.Info("disconnected player was the current turn; checking game state")
+			if g.checkForLastPlayerStanding() {
+				return
+			}
+			g.incNextPlayer()
+			if g.isBettingRoundComplete() {
 				g.advanceToNexRound()
 			}
 		}
@@ -938,10 +943,7 @@ func (g *Game) RemovePlayer(addr string) {
 }
 
 func (g *Game) AddPlayer(from string) {
-	// If the player is being added to the game. We are going to assume
-	// that he is ready to play.
 	g.playersList.add(from)
-	sort.Sort(g.playersList)
 }
 
 func (g *Game) loop() {
@@ -950,6 +952,7 @@ func (g *Game) loop() {
 	for {
 		<-ticker.C
 
+		g.mu.Lock()
 		currentDealerAddr, _ := g.getCurrentDealerAddr()
 		logrus.WithFields(logrus.Fields{
 			"we":             g.listenAddr,
@@ -958,6 +961,7 @@ func (g *Game) loop() {
 			"currentDealer":  currentDealerAddr,
 			"nextPlayerTurn": g.currentPlayerTurn,
 		}).Info()
+		g.mu.Unlock()
 	}
 }
 

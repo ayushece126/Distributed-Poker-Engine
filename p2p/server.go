@@ -1,7 +1,6 @@
 package p2p
 
 import (
-	"bytes"
 	"encoding/gob"
 	"fmt"
 	"net"
@@ -132,12 +131,7 @@ func (s *Server) sendPeerList(p *Peer) error {
 	}
 
 	msg := NewMessage(s.ListenAddr, peerList)
-	buf := new(bytes.Buffer)
-	if err := gob.NewEncoder(buf).Encode(msg); err != nil {
-		return err
-	}
-
-	return p.Send(buf.Bytes())
+	return p.Send(msg)
 }
 
 func (s *Server) AddPeer(p *Peer) {
@@ -173,12 +167,7 @@ func (s *Server) SendHandshake(p *Peer) error {
 		ListenAddr:  s.ListenAddr,
 	}
 
-	buf := new(bytes.Buffer)
-	if err := gob.NewEncoder(buf).Encode(hs); err != nil {
-		return err
-	}
-
-	return p.Send(buf.Bytes())
+	return p.Send(hs)
 }
 
 func (s *Server) isInPeerList(addr string) bool {
@@ -203,10 +192,7 @@ func (s *Server) Connect(addr string) error {
 		return err
 	}
 
-	peer := &Peer{
-		conn:     conn,
-		outbound: true,
-	}
+	peer := NewPeer(conn, true)
 
 	s.addPeer <- peer
 
@@ -297,17 +283,12 @@ func (s *Server) handleNewPeer(peer *Peer) error {
 func (s *Server) Broadcast(broadcastMsg BroadcastTo) error {
 	msg := NewMessage(s.ListenAddr, broadcastMsg.Payload)
 
-	buf := new(bytes.Buffer)
-	if err := gob.NewEncoder(buf).Encode(msg); err != nil {
-		return err
-	}
-
 	for _, addr := range broadcastMsg.To {
 		peer, ok := s.peers[addr]
 
 		if ok {
 			go func(peer *Peer) {
-				if err := peer.Send(buf.Bytes()); err != nil {
+				if err := peer.Send(msg); err != nil {
 					logrus.Errorf("broadcast to peer error: %s", err)
 				}
 			}(peer)
@@ -323,7 +304,7 @@ func (s *Server) handshake(p *Peer) (*Handshake, error) {
 	}
 
 	hs := &Handshake{}
-	if err := gob.NewDecoder(p.conn).Decode(hs); err != nil {
+	if err := p.dec.Decode(hs); err != nil {
 		return nil, err
 	}
 

@@ -3,6 +3,7 @@ package p2p
 import (
 	"encoding/gob"
 	"net"
+	"sync"
 
 	"github.com/sirupsen/logrus"
 )
@@ -16,17 +17,30 @@ type Peer struct {
 	conn       net.Conn
 	outbound   bool
 	listenAddr string
+	mu         sync.Mutex // protects concurrent writes to conn
+	enc        *gob.Encoder
+	dec        *gob.Decoder
 }
 
-func (p *Peer) Send(b []byte) error {
-	_, err := p.conn.Write(b)
-	return err
+func NewPeer(conn net.Conn, outbound bool) *Peer {
+	return &Peer{
+		conn:     conn,
+		outbound: outbound,
+		enc:      gob.NewEncoder(conn),
+		dec:      gob.NewDecoder(conn),
+	}
+}
+
+func (p *Peer) Send(payload any) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.enc.Encode(payload)
 }
 
 func (p *Peer) ReadLoop(msgch chan *Message, delch chan *Peer) {
 	for {
 		msg := new(Message)
-		if err := gob.NewDecoder(p.conn).Decode(msg); err != nil {
+		if err := p.dec.Decode(msg); err != nil {
 			logrus.Errorf("decode message error from %s: %s", p.conn.RemoteAddr(), err)
 			break
 		}
@@ -66,10 +80,7 @@ func (t *TCPTransport) ListenAndAccept() error {
 			continue
 		}
 
-		peer := &Peer{
-			conn:     conn,
-			outbound: false,
-		}
+		peer := NewPeer(conn, false)
 
 		t.AddPeer <- peer
 	}
